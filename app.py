@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-MotoTrack - Actividad 2: Costos, clasificacion ABC-XYZ y motor de pronosticos.
+Mototrack - Costos, clasificacion ABC-XYZ y motor de pronosticos.
 
 Aplicacion local en Streamlit (alternativa al desarrollo manual en Excel).
-Integra datos de MotoTrack con costos y precios validados, calcula utilidad
+Integra datos de Mototrack con costos y precios validados, calcula utilidad
 de los 8 SKU, construye ABC, ejecuta el motor de pronosticos con
 statsforecast, clasifica XYZ segun el desempeno del pronostico (Score%),
 combina ABC-XYZ, visualiza y exporta resultados a Excel.
@@ -75,7 +75,7 @@ COLOR_PRODUCTO = {"MOTO": "salmon", "CUATRIMOTO": "navy", "TRACTOR": "darkcyan"}
 # ---------------------------------------------------------------------------
 
 def leer_demanda(archivo) -> pd.DataFrame:
-    """Lee la hoja 'Demand' del Excel de MotoTrack.
+    """Lee la hoja 'Demand' del Excel de Mototrack.
 
     Estructura oficial (seccion 5.1):
       - fila 1: nombres decorativos de tiendas.
@@ -899,8 +899,8 @@ def _motor_cacheado(demanda: pd.DataFrame, n_windows: int, h: int):
 
 
 def main():
-    st.set_page_config(page_title="MotoTrack - ABC-XYZ", layout="wide")
-    st.title("MotoTrack - Actividad 2: Costos, ABC-XYZ y Pronosticos")
+    st.set_page_config(page_title="Mototrack", layout="wide")
+    st.title("Mototrack")
     st.markdown(
         "Aplicacion local para la Actividad 2 de Gestion de Inventarios. "
         "Todos los calculos son trazables y verificables segun la metodologia."
@@ -908,11 +908,11 @@ def main():
 
     st.sidebar.header("1. Carga de datos")
     archivo = st.sidebar.file_uploader(
-        "Cargar Excel de MotoTrack (.xlsx)", type=["xlsx"]
+        "Cargar Excel de Mototrack (.xlsx)", type=["xlsx"]
     )
 
     if archivo is None:
-        st.info("Carga el archivo Excel de MotoTrack para comenzar. "
+        st.info("Carga el archivo Excel de Mototrack para comenzar. "
                 "Debe contener las hojas 'Demand' y 'Costos y Precios'.")
         return
 
@@ -1340,7 +1340,7 @@ def main():
                 f"(minimo recomendado: 4).")
 
         st.markdown("---")
-        nombre_salida = "Resultados_ABC_XYZ_MotoTrack.xlsx"
+        nombre_salida = "Resultados_ABC_XYZ_Mototrack.xlsx"
         ruta_salida = os.path.join(os.getcwd(), nombre_salida)
         listo_exportar = umbral_ok and not abc_xyz.empty
         if not listo_exportar:
