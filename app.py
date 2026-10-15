@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy.stats import norm
 
 from statsforecast import StatsForecast
 from statsforecast.models import (
@@ -660,7 +661,6 @@ def disenar_revision_periodica(ganadores: dict, pronosticos: dict,
             "Demanda en P (suma pronosticos)": demanda_p,
             "RMSE (motor)": rmse,
             "sigma_P = RMSE*sqrt(P)": sigma_p,
-            "Z (servicio)": Z,
             "Stock de seguridad": ss,
             "Nivel objetivo S": nivel_s,
             "Cubre horizonte": cubre,
@@ -1142,10 +1142,18 @@ def main():
                              min_value=1, max_value=20, value=4, step=1)
         L = rs2.number_input("L (lead time / entrega, turnos)",
                              min_value=0, max_value=20, value=2, step=1)
-        Z = rs3.number_input("Z (nivel de servicio)",
-                             min_value=0.0, max_value=3.0, value=1.645,
-                             step=0.01, format="%.3f",
-                             help="1.645 ~ 95%; 2.054 ~ 98%; 1.282 ~ 90%.")
+        NC = rs3.number_input("NC (nivel de servicio, %)",
+                              min_value=50.0, max_value=99.99, value=95.0,
+                              step=0.1, format="%.2f",
+                              help="Nivel de servicio objetivo en %. El "
+                                   "modelo lo convierte internamente al "
+                                   "factor Z = Phi^-1(NC/100) y usa ese Z "
+                                   "para el stock de seguridad (SS = Z*sigma_P). "
+                                   "Ej.: 90% -> Z=1.282; 95% -> Z=1.645; "
+                                   "98% -> Z=2.054.")
+        # El usuario fija NC en % (valor que cambia a voluntad); internamente
+        # se sigue usando el factor Z, igual que antes, para calcular SS.
+        Z = float(norm.ppf(NC / 100.0))
 
         P_rs = int(R) + int(L)
         if P_rs > h:
@@ -1185,11 +1193,32 @@ def main():
         columnas_t1 = [
             "Ref", "Regional", "Producto", "Modelo ganador", "P = R+L",
             "Demanda en P (suma pronosticos)", "RMSE (motor)",
-            "sigma_P = RMSE*sqrt(P)", "Z (servicio)",
+            "sigma_P = RMSE*sqrt(P)",
             "Stock de seguridad", "Nivel objetivo S",
         ]
         st.dataframe(rs_tabla[columnas_t1], use_container_width=True,
                      hide_index=True)
+
+        # --- Indicacion 2: control de calidad del dato. Una serie con
+        # RMSE ~ 0 se ajusta de forma determinista (valor constante o captura
+        # erronea, p. ej. demanda = numero de turno); el modelo no pone stock
+        # de seguridad y su S/Q puede ser un artefacto que sobreinfla el
+        # pedido. Se marca para verificar el Excel fuente antes de pedir.
+        sospechosas = rs_tabla[
+            rs_tabla["RMSE (motor)"].notna()
+            & (rs_tabla["RMSE (motor)"] < 0.01)
+        ]
+        if not sospechosas.empty:
+            refs_sospecha = ", ".join(sospechosas["Ref"].tolist())
+            st.warning(
+                f"**Calidad del dato (Indicacion 2):** {len(sospechosas)} "
+                f"referencia(s) con RMSE ~ 0: {refs_sospecha}. Una serie con "
+                "RMSE casi nulo es determinista (constante o captura erronea, "
+                "p. ej. demanda igual al numero de turno); el modelo no aplica "
+                "stock de seguridad y su S/Q puede ser un artefacto que "
+                "sobreinfla el pedido. Verifique esas columnas en el Excel "
+                "fuente antes de dar luz verde."
+            )
 
         # --- Tabla 2: insumos editables (I y IO) y Q ya recalculado.
         # Las ediciones del navegador quedan pendientes al inicio del rerun
@@ -1225,30 +1254,48 @@ def main():
                 st.session_state["rs_inputs"].get(ref, {}).get(key, 0.0)
             )
 
-        st.markdown("**Tabla 2 - Corrida en V-logistics:**")
+        def _estado(desv, s_obj):
+            """Clasifica la posicion de inventario vs el nivel objetivo S."""
+            if pd.isna(desv) or pd.isna(s_obj):
+                return "Sin dato"
+            if desv > 0:
+                return "Sobrestock"
+            if desv >= -0.10 * s_obj:
+                return "Al limite"
+            return "En riesgo de quiebre"
+
+        st.markdown("**Q: cantidad a pedir**")
         st.caption(
             "Edite el **Inventario disponible (I)** y las **Ordenes en "
-            "transito (IO)** observados en el juego; la columna **Q "
-            "(cantidad a pedir)** se recalcula al instante."
+            "transito (IO)** observados en el juego; **Q (cantidad a pedir)** "
+            "y el **Estado** se recalculan al instante. Desviacion = "
+            "(I + IO) - S: >0 sobrestock (congele su Q); 0 a -10% de S al "
+            "limite; < -10% de S en riesgo de quiebre (luz verde urgente)."
+        )
+        _i_vals = [_insumo(r, "I") for r in rs_tabla["Ref"]]
+        _io_vals = [_insumo(r, "IO") for r in rs_tabla["Ref"]]
+        _pos_vals = [i + io for i, io in zip(_i_vals, _io_vals)]
+        _s_vals = rs_tabla["Nivel objetivo S"]
+        _desv_vals = [
+            (p - s) if pd.notna(s) else np.nan
+            for p, s in zip(_pos_vals, _s_vals)
+        ]
+        _est_vals = [_estado(d, s) for d, s in zip(_desv_vals, _s_vals)]
+        _q_vals = np.where(
+            _s_vals.notna(),
+            (_s_vals - pd.Series(_pos_vals, index=rs_tabla.index)).clip(lower=0),
+            np.nan,
         )
         tabla2 = pd.DataFrame({
             "Ref": rs_tabla["Ref"],
-            "Nivel objetivo S": rs_tabla["Nivel objetivo S"],
-            "Inventario disponible (I)": [
-                _insumo(r, "I") for r in rs_tabla["Ref"]
-            ],
-            "Ordenes en transito (IO)": [
-                _insumo(r, "IO") for r in rs_tabla["Ref"]
-            ],
+            "Estado": _est_vals,
+            "Nivel objetivo S": _s_vals,
+            "Inventario disponible (I)": _i_vals,
+            "Ordenes en transito (IO)": _io_vals,
+            "Posicion de inventario (I+IO)": _pos_vals,
+            "Desviacion vs S (I+IO - S)": _desv_vals,
+            "Q (cantidad a pedir)": _q_vals,
         })
-        # Q = S - (I + IO); no se pide si Q <= 0 o si S no esta disponible.
-        tabla2["Q (cantidad a pedir)"] = np.where(
-            tabla2["Nivel objetivo S"].notna(),
-            (tabla2["Nivel objetivo S"]
-             - tabla2["Inventario disponible (I)"]
-             - tabla2["Ordenes en transito (IO)"]).clip(lower=0),
-            np.nan,
-        )
         edited = st.data_editor(
             tabla2,
             column_config={
@@ -1259,7 +1306,14 @@ def main():
                     "Ordenes en transito (IO)", min_value=0, step=1,
                     help="Unidades ya pedidas y en transito (del juego)."),
             },
-            disabled=["Ref", "Nivel objetivo S", "Q (cantidad a pedir)"],
+            disabled=[
+                "Ref",
+                "Estado",
+                "Nivel objetivo S",
+                "Posicion de inventario (I+IO)",
+                "Desviacion vs S (I+IO - S)",
+                "Q (cantidad a pedir)",
+            ],
             use_container_width=True,
             hide_index=True,
             key="editor_rs2",
@@ -1273,7 +1327,7 @@ def main():
             }
         st.session_state["rs_refs"] = list(edited["Ref"])
 
-        # rs_tabla completa (modelo + insumos + Q) para grafico y exportacion.
+        # rs_tabla completa (modelo + insumos + estado + Q) para grafico y exportacion.
         mapa_ed = edited.set_index("Ref")
         rs_tabla["Inventario disponible (I)"] = rs_tabla["Ref"].map(
             mapa_ed["Inventario disponible (I)"])
@@ -1283,6 +1337,15 @@ def main():
             rs_tabla["Inventario disponible (I)"]
             + rs_tabla["Ordenes en transito (IO)"]
         )
+        rs_tabla["Desviacion vs S (I+IO - S)"] = (
+            rs_tabla["Posicion de inventario (I+IO)"]
+            - rs_tabla["Nivel objetivo S"]
+        )
+        rs_tabla["Estado"] = [
+            _estado(d, s) for d, s in zip(
+                rs_tabla["Desviacion vs S (I+IO - S)"],
+                rs_tabla["Nivel objetivo S"])
+        ]
         rs_tabla["Q (cantidad a pedir)"] = np.where(
             rs_tabla["Nivel objetivo S"].notna(),
             (rs_tabla["Nivel objetivo S"]
