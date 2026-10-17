@@ -80,53 +80,126 @@ def leer_demanda(archivo) -> pd.DataFrame:
 
     Estructura oficial (seccion 5.1):
       - fila 1: nombres decorativos de tiendas.
-      - fila 2: encabezados reales  -> en pandas usar header=1.
+      - fila 2: encabezados reales (se validan por posicion, sin pasarlos
+        por pandas para no deduplicar los nombres repetidos).
       - fila 3 en adelante: datos.
-      - Norte: columnas A-D; Centro: F-I; Sur: K-M.
-      - E y J: separadores vacios. Sur no tiene Tractor.
+      - Norte: col A=Turn, B=MOTO, C=CUATRIMOTO, D=TRACTOR.
+      - Centro: col F=Turn, G=MOTO, H=CUATRIMOTO, I=TRACTOR.
+      - Sur: col K=Turn, L=MOTO, M=CUATRIMOTO (sin Tractor-Sur).
+      - E y J: separadores vacios.
       - 'Turn' es entero consecutivo; un turno = un periodo.
 
     Devuelve un DataFrame largo: Turn | REGIONAL | PRODUCTO | DEMANDA
     """
-    # header=1 -> la fila 2 de Excel son los encabezados reales.
-    df = pd.read_excel(archivo, sheet_name="Demand", header=1)
-    df.columns = [str(c).strip() for c in df.columns]
+    # Se lee SIN encabezados (header=None) porque la hoja repite los nombres
+    # "Turn", "MOTO", "CUATRIMOTO" y "TRACTOR" en los tres bloques
+    # Norte/Centro/Sur. Si se usara header=1, pandas renombraria las
+    # repeticiones a "Turn.1", "MOTO.2", etc. y la validacion por posicion
+    # fallaria contra esos nombres artificialmente deduplicados. Con
+    # header=None se validan los valores crudos de la fila 2 (indice 1).
+    crudo = pd.read_excel(archivo, sheet_name="Demand", header=None)
 
-    if "Turn" not in df.columns:
+    ncols = crudo.shape[1]
+    if ncols < 13:
         raise ValueError(
-            "La hoja 'Demand' no contiene la columna 'Turn' en la fila de "
-            "encabezados reales (fila 2). Estructura inesperada."
+            f"La hoja 'Demand' debe tener al menos 13 columnas (A-M), "
+            f"tiene {ncols}. Estructura inesperada."
         )
 
-    # Columnas de demanda por posicion (no por nombre decorativo). El orden
-    # en el Excel tras 'Turn' es: Norte(M,C,T), Centro(M,C,T), Sur(M,C).
-    columnas = list(df.columns)
-    idx_turn = columnas.index("Turn")
-    posteriores = columnas[idx_turn + 1:]
-    # Descartamos separadores vacios (Unnamed) y tomamos las 8 de demanda.
-    demanda_cols = [c for c in posteriores if not c.lower().startswith("unnamed")]
-
-    if len(demanda_cols) < 8:
+    if crudo.shape[0] < 3:
         raise ValueError(
-            f"Se esperaban al menos 8 columnas de demanda (8 SKU) tras 'Turn', "
-            f"pero se encontraron {len(demanda_cols)}. Estructura inesperada."
+            "La hoja 'Demand' debe tener al menos 3 filas "
+            "(fila decorativa, fila de encabezados y datos). "
+            "Estructura inesperada."
         )
 
-    demanda_cols = demanda_cols[:8]
-    mapa_col_sku = dict(zip(demanda_cols, SKU_UNIVERSO))
+    # Fila 2 (indice 1) contiene los encabezados reales.
+    encabezados = crudo.iloc[1]
+
+    # Mapeo explícito por POSICION de columna (índice base 0 del DataFrame).
+    # A=0, B=1, C=2, D=3, E=4(sep), F=5, G=6, H=7, I=8, J=9(sep), K=10, L=11, M=12
+    POS_NORTE_TURN = 0
+    POS_NORTE_MOTO = 1
+    POS_NORTE_CUATRI = 2
+    POS_NORTE_TRACTOR = 3
+    POS_CENTRO_TURN = 5
+    POS_CENTRO_MOTO = 6
+    POS_CENTRO_CUATRI = 7
+    POS_CENTRO_TRACTOR = 8
+    POS_SUR_TURN = 10
+    POS_SUR_MOTO = 11
+    POS_SUR_CUATRI = 12
+
+    # Validar encabezados en las posiciones esperadas.
+    def _check_header(idx, esperado):
+        if idx >= ncols:
+            raise ValueError(
+                f"La hoja 'Demand' no tiene la columna en la posicion {idx} "
+                f"(esperado '{esperado}'). Estructura inesperada."
+            )
+        real = "" if pd.isna(encabezados.iloc[idx]) else str(encabezados.iloc[idx]).strip()
+        if real != esperado:
+            raise ValueError(
+                f"Encabezado inesperado en posicion {idx}: se esperaba "
+                f"'{esperado}', se encontro '{real}'. "
+                "La estructura de 'Demand' no coincide con el oficial."
+            )
+
+    _check_header(POS_NORTE_TURN, "Turn")
+    _check_header(POS_NORTE_MOTO, "MOTO")
+    _check_header(POS_NORTE_CUATRI, "CUATRIMOTO")
+    _check_header(POS_NORTE_TRACTOR, "TRACTOR")
+    _check_header(POS_CENTRO_TURN, "Turn")
+    _check_header(POS_CENTRO_MOTO, "MOTO")
+    _check_header(POS_CENTRO_CUATRI, "CUATRIMOTO")
+    _check_header(POS_CENTRO_TRACTOR, "TRACTOR")
+    _check_header(POS_SUR_TURN, "Turn")
+    _check_header(POS_SUR_MOTO, "MOTO")
+    _check_header(POS_SUR_CUATRI, "CUATRIMOTO")
+
+    # Las ocho columnas reales de demanda (SKU -> posicion de columna).
+    # Se accede por posicion (iloc) para evitar problemas con nombres
+    # de columna duplicados ("Turn" aparece 3 veces, "MOTO" 3 veces, etc.).
+    BLOQUES = [
+        ("NORTE", "MOTO", POS_NORTE_MOTO),
+        ("NORTE", "CUATRIMOTO", POS_NORTE_CUATRI),
+        ("NORTE", "TRACTOR", POS_NORTE_TRACTOR),
+        ("CENTRO", "MOTO", POS_CENTRO_MOTO),
+        ("CENTRO", "CUATRIMOTO", POS_CENTRO_CUATRI),
+        ("CENTRO", "TRACTOR", POS_CENTRO_TRACTOR),
+        ("SUR", "MOTO", POS_SUR_MOTO),
+        ("SUR", "CUATRIMOTO", POS_SUR_CUATRI),
+    ]
+    POS_TURN = [POS_NORTE_TURN, POS_CENTRO_TURN, POS_SUR_TURN]
+
+    # Datos desde la fila 3 en adelante (indice 2: se saltan la decorativa
+    # y la de encabezados, ya validada).
+    datos = crudo.iloc[2:].reset_index(drop=True)
 
     registros = []
-    for _, fila in df.iterrows():
-        turn = fila["Turn"]
-        if pd.isna(turn):  # separadores / decorativos
+    for _, fila in datos.iterrows():
+        # Leer turnos de los tres bloques por posicion.
+        turns_raw = [fila.iloc[idx] for idx in POS_TURN]
+
+        # Filas separadoras / decorativas sin turno en ningún bloque.
+        if all(pd.isna(t) for t in turns_raw):
             continue
-        turn = int(turn)
-        for col in demanda_cols:
-            valor = fila[col]
-            # Distinguimos cero de faltante (seccion 6): el 0 es demanda valida.
+
+        # Validar que los turnos de los tres bloques coincidan.
+        turns_int = [int(t) for t in turns_raw if not pd.isna(t)]
+        if len(set(turns_int)) > 1:
+            raise ValueError(
+                "Los turnos de los bloques NORTE/CENTRO/SUR no coinciden: "
+                f"{turns_int}. La hoja 'Demand' tiene turnos desalineados."
+            )
+        turn = turns_int[0]
+
+        # Leer únicamente las ocho columnas reales de demanda.
+        # Una celda vacía (NaN) se omite: no es demanda cero, es falta de dato.
+        for regional, producto, pos_col in BLOQUES:
+            valor = fila.iloc[pos_col]
             if pd.isna(valor):
                 continue
-            regional, producto = mapa_col_sku[col]
             registros.append(
                 {
                     "Turn": turn,
@@ -1178,12 +1251,20 @@ def main():
             st.session_state["rs_inputs"] = {}  # {Ref: {"I":.., "IO":..}}
 
         def _num(valor):
-            """Convierte un valor editado a float (vacio/invalido -> 0)."""
+            """Convierte un valor editado a float.
+
+            Vacío / None / NaN  -> np.nan  (desconocido: no se asume cero).
+            Cero explícito     -> 0.0     (confirmado por el usuario).
+            """
+            if valor is None:
+                return np.nan
+            if isinstance(valor, float) and np.isnan(valor):
+                return np.nan
             try:
                 f = float(valor)
             except (TypeError, ValueError):
-                return 0.0
-            return 0.0 if np.isnan(f) else f
+                return np.nan
+            return f
 
         st.caption(
             "Tabla 1: una fila por referencia (Norte, Centro, Sur y CEDI; Sur "
@@ -1281,9 +1362,10 @@ def main():
             for p, s in zip(_pos_vals, _s_vals)
         ]
         _est_vals = [_estado(d, s) for d, s in zip(_desv_vals, _s_vals)]
+        _pos_series = pd.Series(_pos_vals, index=rs_tabla.index)
         _q_vals = np.where(
-            _s_vals.notna(),
-            (_s_vals - pd.Series(_pos_vals, index=rs_tabla.index)).clip(lower=0),
+            _s_vals.notna() & _pos_series.notna(),
+            (_s_vals - _pos_series).clip(lower=0),
             np.nan,
         )
         tabla2 = pd.DataFrame({
@@ -1347,7 +1429,8 @@ def main():
                 rs_tabla["Nivel objetivo S"])
         ]
         rs_tabla["Q (cantidad a pedir)"] = np.where(
-            rs_tabla["Nivel objetivo S"].notna(),
+            rs_tabla["Nivel objetivo S"].notna()
+            & rs_tabla["Posicion de inventario (I+IO)"].notna(),
             (rs_tabla["Nivel objetivo S"]
              - rs_tabla["Posicion de inventario (I+IO)"]).clip(lower=0),
             np.nan,
