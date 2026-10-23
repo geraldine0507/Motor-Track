@@ -602,9 +602,7 @@ def preparar_datos_ifr(ventas: pd.DataFrame, inventario: pd.DataFrame) -> tuple:
 
     # Alarme si no hay datos de ventas
     if ventas.empty or inventario.empty:
-        return pd.DataFrame(),
-               1.0,
-               {}
+        return pd.DataFrame(), 1.0, {}
 
     for regional in ["NORTE", "CENTRO", "SUR"]:
         for producto in PRODUCTOS:
@@ -1436,9 +1434,6 @@ def generar_excel(abc: pd.DataFrame, costos: pd.DataFrame, abc_xyz: pd.DataFrame
             rs_tabla.to_excel(writer, sheet_name="Revision_Periodica_RS",
                               index=False)
 
-
-    # --- Agregar indicadores adicionales al Excel
-    # (IFR, Rotacion e GMROI) si hay datos de ventas e inventario.
 
     # --- Agregar indicadores adicionales al Excel
     # (IFR, Rotacion e GMROI) si hay datos de ventas e inventario.
