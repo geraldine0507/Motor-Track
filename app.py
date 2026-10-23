@@ -328,6 +328,85 @@ def leer_ventas(archivo) -> pd.DataFrame:
     return df_vent.drop_duplicates().reset_index(drop=True)
 
 
+def leer_inventario(archivo) -> pd.DataFrame:
+    """Lee las hojas de inventario del Excel.
+
+    Se esperan las hojas: INVENTARIO.NORTE, INVENTARIO.CENTRO, INVENTARIO.SUR.
+    Cada una contiene: Turno | REGIONAL | PRODUCTO | INVENTARIO.
+
+    Devuelve un DataFrame largo: Turn | REGIONAL | PRODUCTO | INVENTARIO
+    """
+    inventarios = []
+
+    for regional, sheet_nombre in [
+        ("NORTE", "INVENTARIO.NORTE"),
+        ("CENTRO", "INVENTARIO.CENTRO"),
+        ("SUR", "INVENTARIO.SUR"),
+    ]:
+        try:
+            df = pd.read_excel(archivo, sheet_name=sheet_nombre, header=None)
+        except Exception:
+            continue
+
+        if df.empty or df.shape[0] < 2:
+            continue
+
+        df_data = df.iloc[2:].reset_index(drop=True) if df.shape[0] > 2 else df.iloc[1:].reset_index(drop=True)
+        encabezados_raw = df.iloc[1].fillna("").astype(str).str.strip() if df.shape[0] > 1 else pd.Series(dtype=str)
+
+        turn_col = None
+        prod_col = None
+        regional_col = None
+        inventario_col = None
+
+        for idx, header in enumerate(encabezados_raw):
+            h_lower = header.lower()
+            if turn_col is None and any(p in h_lower for p in ["turn", "per", "periodo"]):
+                turn_col = idx
+            elif prod_col is None and any(p in h_lower for p in ["prod", "producto", "sku", "item", "nombre"]):
+                prod_col = idx
+            elif regional_col is None and any(p in h_lower for p in ["region", "reg", "loc", "ubicacion", "centro", "norte", "sur"]):
+                regional_col = idx
+            elif inventario_col is None and any(p in h_lower for p in ["invent", "inv", "stock"]):
+                inventario_col = idx
+
+        if turn_col is None: turn_col = 0
+        if prod_col is None: prod_col = 1
+        if regional_col is None: regional_col = 0
+        if inventario_col is None: inventario_col = 2
+
+        for _, fila in df_data.iterrows():
+            try:
+                turn = int(fila.iloc[turn_col])
+            except (ValueError, TypeError):
+                if pd.isna(fila.iloc[turn_col]):
+                    continue
+                continue
+
+            prod = fila.iloc[prod_col]
+            regional = fila.iloc[regional_col]
+            try:
+                inv = float(fila.iloc[inventario_col])
+            except (ValueError, TypeError):
+                inv = np.nan
+
+            if pd.isna(prod) or pd.isna(inv):
+                continue
+
+            inventarios.append({
+                "Turn": turn,
+                "REGIONAL": str(regional).strip() if pd.notna(regional) else regional,
+                "PRODUCTO": str(prod).strip(),
+                "INVENTARIO": inv,
+            })
+
+    if not inventarios:
+        return pd.DataFrame(columns=["Turn", "REGIONAL", "PRODUCTO", "INVENTARIO"])
+
+    df_inv = pd.DataFrame(inventarios)
+    return df_inv.drop_duplicates().reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # Cálculo de indicadores financieros e inventarios (seccion 8)
 # ---------------------------------------------------------------------------
@@ -1922,7 +2001,7 @@ def main():
             "nivel objetivo **S**. Se usan los **pronosticos** del modelo "
             "ganador y el **RMSE** del motor (no el promedio ni la desviacion "
             "del historico) para estimar la demanda del periodo de proteccion "
-            "y el stock de seguridad."
+            "y el stock de seguridad.")
 
     # --- Pestana 9: Indicador de Tasa de Llenado (IFR)
     with tab_ifr:
@@ -1981,7 +2060,6 @@ def main():
         elif rot_df.empty:
             st.info("No hay datos suficientes de ventas, inventario y costos "
                     "para calcular el GMROI.")
-        )
 
         rs1, rs2, rs3 = st.columns(3)
         R = rs1.number_input("R (periodo de revision, turnos)",
