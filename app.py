@@ -253,6 +253,623 @@ def leer_costos(archivo) -> pd.DataFrame:
     return costos
 
 
+def leer_ventas(archivo) -> pd.DataFrame:
+    """Lee las hojas de ventas del Excel.
+
+    Se esperan las hojas: VENTAS.CENTRO, VENTAS.NORTE, VENTAS.SUR.
+    Cada una contiene: Turno | REGIONAL | PRODUCTO | VENTAS.
+
+    Devuelve un DataFrame largo: Turn | REGIONAL | PRODUCTO | VENTAS
+    """
+    ventas = []
+
+    for regional, sheet_nombre in [("NORTE", "VENTAS.NORTE"), ("CENTRO", "VENTAS.CENTRO"), ("SUR", "VENTAS.SUR")]:
+        try:
+            df = pd.read_excel(archivo, sheet_name=sheet_nombre, header=None)
+        except Exception:
+            continue
+
+        if df.empty or df.shape[0] < 2:
+            continue
+
+        df_data = df.iloc[2:].reset_index(drop=True) if df.shape[0] > 2 else df.iloc[1:].reset_index(drop=True)
+        encabezados_raw = df.iloc[1].fillna("").astype(str).str.strip() if df.shape[0] > 1 else pd.Series(dtype=str)
+
+        turn_col = None
+        prod_col = None
+        regional_col = None
+        ventas_col = None
+
+        for idx, header in enumerate(encabezados_raw):
+            h_lower = header.lower()
+            if turn_col is None and any(p in h_lower for p in ["turn", "per", "periodo"]):
+                turn_col = idx
+            elif prod_col is None and any(p in h_lower for p in ["prod", "producto", "sku", "item", "nombre"]):
+                prod_col = idx
+            elif regional_col is None and any(p in h_lower for p in ["region", "reg", "loc", "ubicacion", "centro", "norte", "sur"]):
+                regional_col = idx
+            elif ventas_col is None and any(p in h_lower for p in ["vent", "venta", "vta", "vend"]):
+                ventas_col = idx
+
+        if turn_col is None: turn_col = 0
+        if prod_col is None: prod_col = 1
+        if regional_col is None: regional_col = 0
+        if ventas_col is None: ventas_col = 2
+
+        for _, fila in df_data.iterrows():
+            try:
+                turn = int(fila.iloc[turn_col])
+            except (ValueError, TypeError):
+                if pd.isna(fila.iloc[turn_col]):
+                    continue
+                continue
+
+            prod = fila.iloc[prod_col]
+            regional = fila.iloc[regional_col]
+            try:
+                venta = float(fila.iloc[ventas_col])
+            except (ValueError, TypeError):
+                venta = np.nan
+
+            if pd.isna(prod) or pd.isna(venta):
+                continue
+
+            ventas.append({
+                "Turn": turn,
+                "REGIONAL": str(regional).strip() if pd.notna(regional) else regional,
+                "PRODUCTO": str(prod).strip(),
+                "VENTAS": venta,
+            })
+
+    if not ventas:
+        return pd.DataFrame(columns=["Turn", "REGIONAL", "PRODUCTO", "VENTAS"])
+
+    df_vent = pd.DataFrame(ventas)
+    return df_vent.drop_duplicates().reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Cálculo de indicadores financieros e inventarios (seccion 8)
+# ---------------------------------------------------------------------------
+
+
+def calcular_ifr_referencia(ventas: pd.DataFrame, inventario: pd.DataFrame,
+                            producto: str, regional: str) -> tuple:
+    """Calcula el Item Fill Rate por referencia y producto para un periodo.
+
+    IFR = Unidades demanadas cubiertas / Unidades demanadas
+
+    Se calcula a nivel de semana/turno para permitir el analisis
+    temporal semanal.
+
+    Devuelve: (porcentajes_por_trimestre, total_cubiertas, total_demanado)
+    """
+    ventas_prod = ventas[
+        (ventas["PRODUCTO"] == producto) & (ventas["REGIONAL"] == regional)
+    ].copy()
+
+    inv_prod = inventario[
+        (inventario["PRODUCTO"] == producto) & (inventario["REGIONAL"] == regional)
+    ].copy()
+
+    if ventas_prod.empty:
+        return pd.Series(dtype=float), 0.0, 0.0
+
+    ventas_grupo = ventas_prod.groupby("Turn")["VENTAS"].sum().sort_index()
+    inv_grupo = inv_prod.groupby("Turn")["INVENTARIO"].sum().sort_index()
+
+    fpr_trim = []
+
+    for turn, demanda in ventas_grupo.items():
+        if demanda > 0:
+            inv_disp = inv_grupo.get(turn, 0.0)
+            cubierto = min(inv_disp, demanda)
+            ifr = cubierto / demanda
+            fpr_trim.append(ifr)
+        else:
+            fpr_trim.append(1.0)
+
+    return pd.Series(fpr_trim, index=ventas_grupo.index), ventas_grupo.sum(), 0.0
+
+
+def calcular_ifr_global(ventas: pd.DataFrame, inventario: pd.DataFrame) -> float:
+    """Calcula el IFR global para el portfolio completo.
+
+    IFR_global = Σ unidades cubiertas / Σ unidades demanadas
+
+    Esto evidencia la robustez/global del servicio.
+    """
+    total_demanado = ventas["VENTAS"].sum()
+    if total_demanado == 0:
+        return 1.0
+
+    total_inventario = inventario["INVENTARIO"].sum()
+
+    cubierto_total = min(total_inventario, total_demanado)
+
+    ifr_global = cubierto_total / total_demanado
+    return ifr_global
+
+
+def calcular_inv_turnover(ventas: pd.DataFrame, inventario: pd.DataFrame,
+                          regional: str) -> pd.DataFrame:
+    """Calcula la rotación de inventarios por referencia.
+
+    ROT = Costo de mercaderia vendida / Inventario promedio
+
+    Para este análisis sin archivo de costos, usamos la demanda como
+    proxy del costo de mercaderia vendida, y el inventario promedio
+    por producto y regional.
+
+    Devuelve un DataFrame con: Producto | Regional | Demanda | Inventario |
+    ROT
+    """
+    ventas_prod = ventas[ventas["REGIONAL"] == regional].copy()
+    inv_prod = inventario[inventario["REGIONAL"] == regional].copy()
+
+    resultado = []
+
+    for producto in PRODUCTOS:
+        dem_prod = ventas_prod[ventas_prod["PRODUCTO"] == producto]["VENTAS"].sum()
+        if dem_prod == 0:
+            continue
+
+        inv_prod_val = inv_prod[inv_prod["PRODUCTO"] == producto]["INVENTARIO"].sum()
+
+        if inv_prod_val == 0:
+            rot = np.nan
+        else:
+            rot = dem_prod / inv_prod_val
+
+        resultado.append({
+            "Producto": producto,
+            "Regional": regional,
+            "Demanda": dem_prod,
+            "Inventario": inv_prod_val,
+            "ROT": rot,
+        })
+
+    return pd.DataFrame(resultado)
+
+
+def calcular_gmroi(ventas: pd.DataFrame, inventario: pd.DataFrame,
+                   costos: pd.DataFrame, regional: str) -> pd.DataFrame:
+    """Calcula el GMROI por referencia y producto.
+
+    GMROI = Utilidad bruta neta / Costo promedio de inventario
+
+    Donde:
+      Utilidad bruta neta = Ventas - Costo de mercaderia
+      Costo de mercaderia = Inventario x Costo unitario
+
+    Formula alternativa:
+      GMROI = (Precio - Costo) / Costo
+
+    Devuelve un DataFrame con: Producto | Regional | Utilidad | Inventario |
+    GMROI
+    """
+    costos_prod = costos[costos["PRODUCTO"].isin(PRODUCTOS)]
+
+    resultado = []
+
+    for producto in PRODUCTOS:
+        cost_prod = costos_prod[costos_prod["PRODUCTO"] == producto]
+        if cost_prod.empty:
+            continue
+
+        precio = float(cost_prod["Precio"].iloc[0])
+        costo_unit = float(cost_prod["Costo"].iloc[0])
+
+        ventas_prod = ventas[
+            (ventas["PRODUCTO"] == producto) & (ventas["REGIONAL"] == regional)
+        ]
+        inv_prod = inventario[
+            (inventario["PRODUCTO"] == producto) & (inventario["REGIONAL"] == regional)
+        ]
+
+        ventas_total = ventas_prod["VENTAS"].sum()
+        inv_total = inv_prod["INVENTARIO"].sum()
+
+        if ventas_total == 0 or inv_total == 0 or costo_unit == 0:
+            gmroi = np.nan
+            utilidad = np.nan
+        else:
+            utilidad = ventas_total * (precio - costo_unit)
+            gmroi = utilidad / (inv_total * costo_unit)
+
+        resultado.append({
+            "Producto": producto,
+            "Regional": regional,
+            "Ventas": ventas_total,
+            "Inventario": inv_total,
+            "Precio": precio,
+            "Costo_unitario": costo_unit,
+            "Utilidad_bruta": utilidad,
+            "GMROI": gmroi,
+        })
+
+    return pd.DataFrame(resultado)
+
+
+# ---------------------------------------------------------------------------
+# Graficas de indicadores (seccion 9)
+# ---------------------------------------------------------------------------
+
+
+def grafica_ifr_semanal_por_referencia(ifr_df: pd.DataFrame) -> go.Figure:
+    """Grafica el IFR semanal por referencia y producto.
+
+    Parametros:
+      ifr_df: DataFrame con columnas [REF, PRODUCTO, TURN, IFR]
+
+    Devuelve una figura con lineas para cada referencia/producto.
+    """
+    if ifr_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No hay datos suficientes para graficar IFR.",
+                           x=0.5, y=0.5, showarrow=False,
+                           font=dict(size=14), showgrid=False, paper_bgcolor="white")
+        return fig
+
+    fig = make_subplots(
+        rows=1, cols=1,
+        subplot_titles=("IFR semanal por referencia y producto",
+                        "Cobertura del servicio de inventario"),
+        x_title="Turno (semana)",
+        y_title="IFR (0-1)"
+    )
+
+    colores = {"NORTE": "#e74c3c", "CENTRO": "#3498db", "SUR": "#2ecc71"}
+
+    for ref in ifr_df["REF"].unique():
+        datos = ifr_df[ifr_df["REF"] == ref]
+        for producto in datos["PRODUCTO"].unique():
+            datos_p = datos[datos["PRODUCTO"] == producto]
+            if datos_p.empty:
+                continue
+            regional = datos_p["REGIONAL"].iloc[0]
+            fig.add_trace(
+                go.Scatter(
+                    x=datos_p["TURN"],
+                    y=datos_p["IFR"] * 100,
+                    mode="lines+markers",
+                    name=f"{producto} ({ref})",
+                    line=dict(color=colores.get(regional, "#95a5a6"), width=2),
+                    marker=dict(size=6),
+                ),
+                row=1, col=1
+            )
+
+    fig.update_layout(
+        title="Tasa de Llenado por Producto y Referencia (IFR)",
+        hovermode="x unified",
+        template="plotly_white",
+        height=450,
+        xaxis=dict(tickmode="linear"),
+    )
+
+    fig.update_yaxes(title_text="IFR (%)", row=1, col=1)
+    return fig
+
+
+def grafica_ifr_global(ifr_global: float, ifr_por_referencia: dict) -> go.Figure:
+    """Grafica el IFR global y por referencia.
+
+    Parametros:
+      ifr_global: valor IFR global
+      ifr_por_referencia: dict con {referencia: valor}
+
+    Devuelve un gráfico de barras comparando el IFR global con el
+    IFR por referencia.
+    """
+    refs = list(ifr_por_referencia.keys())
+    valores = [ifr_por_referencia[r] * 100 for r in refs]
+    valores.append(ifr_global * 100)
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+            x=refs + ["GLOBAL"],
+            y=valores,
+            marker_color=["#e74c3c", "#3498db", "#2ecc71", "#9b59b6"],
+            text=[f"{v:.1f}%" for v in valores],
+            textposition="auto",
+            name="IFR",
+        )
+    )
+
+    fig.update_layout(
+        title="IFR Global y por Referencia",
+        yaxis_title="IFR (%)",
+        template="plotly_white",
+        height=400,
+        showlegend=False,
+    )
+
+    return fig
+
+
+def preparar_datos_ifr(ventas: pd.DataFrame, inventario: pd.DataFrame) -> tuple:
+    """Prepara los datos para graficar IFR por referencia y producto.
+
+    Devuelve:
+      - DataFrame largo para graficar IFR semanal [REF, PRODUCTO, REGIONAL, TURN, IFR]
+      - IFR global
+      - IFR por referencia dict {ref: valor}
+    """
+    ifr_por_producto = []
+
+    # Alarme si no hay datos de ventas
+    if ventas.empty or inventario.empty:
+        return pd.DataFrame(),
+               1.0,
+               {}
+
+    for regional in ["NORTE", "CENTRO", "SUR"]:
+        for producto in PRODUCTOS:
+            ventas_p = ventas[
+                (ventas["PRODUCTO"] == producto) & (ventas["REGIONAL"] == regional)
+            ]
+            if ventas_p.empty:
+                continue
+
+            inv_p = inventario[
+                (inventario["PRODUCTO"] == producto) & (inventario["REGIONAL"] == regional)
+            ]
+            if inv_p.empty:
+                continue
+
+            # Agregar el IFR semanal
+            ventas_grupo = ventas_p.groupby("Turn")["VENTAS"].sum().sort_index()
+            inv_grupo = inv_p.groupby("Turn")["INVENTARIO"].sum().sort_index()
+
+            ifr_semanal = []
+            for turn, demanda in ventas_grupo.items():
+                if demanda > 0:
+                    inv_disp = inv_grupo.get(turn, 0.0)
+                    cubierto = min(inv_disp, demanda)
+                    ifr = cubierto / demanda
+                    ifr_semanal.append(ifr)
+                else:
+                    ifr_semanal.append(1.0)
+
+            if ifr_semanal:
+                ref = f"{regional}-{producto}"
+                ifr_por_producto.append({
+                    "REF": ref,
+                    "PRODUCTO": producto,
+                    "REGIONAL": regional,
+                    "TURN": ventas_grupo.index,
+                    "IFR": ifr_semanal,
+                })
+
+    # Construir el DataFrame largo para graficar
+    if ifr_por_producto:
+        df_ifr = pd.concat([
+            pd.DataFrame({
+                "REF": p["REF"],
+                "PRODUCTO": p["PRODUCTO"],
+                "REGIONAL": p["REGIONAL"],
+                "TURN": p["TURN"][i],
+                "IFR": p["IFR"][i],
+            })
+            for p in ifr_por_producto
+            for i in range(len(p["TURN"]))
+        ], ignore_index=True)
+    else:
+        df_ifr = pd.DataFrame()
+
+    # IFR global
+    total_demanado = ventas["VENTAS"].sum()
+    if total_demanado > 0:
+        total_inventario = inventario["INVENTARIO"].sum()
+        cubierto = min(total_inventario, total_demanado)
+        ifr_global = cubierto / total_demanado
+    else:
+        ifr_global = 1.0
+
+    # IFR por referencia
+    ifr_por_ref = {}
+    if not df_ifr.empty:
+        grp = df_ifr.groupby("REF")["IFR"].mean()
+        ifr_por_ref = grp.to_dict()
+
+    return df_ifr, ifr_global, ifr_por_ref
+
+
+def grafica_rotacion_inventarios(rot_df: pd.DataFrame) -> go.Figure:
+    """Grafica la rotación de inventarios por referencia y producto.
+
+    Parametros:
+      rot_df: DataFrame con columnas [Producto, Regional, Demanda, Inventario, ROT]
+
+    Devuelve un gráfico de barras agrupadas.
+    """
+    if rot_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No hay datos suficientes para graficar rotación.",
+                           x=0.5, y=0.5, showarrow=False,
+                           font=dict(size=14), showgrid=False, paper_bgcolor="white")
+        return fig
+
+    fig = go.Figure()
+
+    # Ordenar por ROT descendente para visual
+    rot_df = rot_df.sort_values("ROT", ascending=False)
+
+    fig.add_trace(
+        go.Bar(
+            x=rot_df["Producto"] + " - " + rot_df["Regional"],
+            y=rot_df["ROT"],
+            marker_color=["#3498db", "#e74c3c", "#2ecc71", "#9b59b6", "#f39c12", "#1abc9c"][:len(rot_df)],
+            text=rot_df["ROT"].apply(lambda x: f"{x:.2f}x" if not pd.isna(x) else "N/A"),
+            textposition="auto",
+            name="Rotación",
+        )
+    )
+
+    fig.update_layout(
+        title="Rotación de Inventarios por Referencia",
+        yaxis_title="ROT (Ventas / Inventario)",
+        template="plotly_white",
+        height=400,
+        xaxis_tickangle=-45,
+    )
+
+    return fig
+
+
+def grafica_gmroi(gmroi_df: pd.DataFrame) -> go.Figure:
+    """Grafica el GMROI por referencia y producto.
+
+    Parametros:
+      gmroi_df: DataFrame con columnas [Producto, Regional, Utilidad_bruta, Inventario, GMROI]
+
+    Devuelve un gráfico de barras con GMROI.
+    """
+    if gmroi_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No hay datos suficientes para graficar GMROI.",
+                           x=0.5, y=0.5, showarrow=False,
+                           font=dict(size=14), showgrid=False, paper_bgcolor="white")
+        return fig
+
+    # Ordenar por GMROI descendente
+    gmroi_df = gmroi_df.sort_values("GMROI", ascending=False)
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+            x=gmroi_df["Producto"] + " - " + gmroi_df["Regional"],
+            y=gmroi_df["GMROI"],
+            marker_color=["#3498db", "#e74c3c", "#2ecc71", "#9b59b6", "#f39c12", "#1abc9c"][:len(gmroi_df)],
+            text=gmroi_df["GMROI"].apply(lambda x: f"{x:.2f}x" if not pd.isna(x) else "N/A"),
+            textposition="auto",
+            name="GMROI",
+        )
+    )
+
+    fig.update_layout(
+        title="GMROI por Referencia y Producto",
+        yaxis_title="GMROI",
+        template="plotly_white",
+        height=400,
+        xaxis_tickangle=-45,
+    )
+
+    return fig
+
+
+def calcular_rotacion_gmroi_comparacion(ventas: pd.DataFrame, inventario: pd.DataFrame,
+                                        costos: pd.DataFrame) -> pd.DataFrame:
+    """Calcula rotación y GMROI combinados para una comparación cruzada.
+
+    Devuelve un DataFrame con: Producto | Regional | Rotación | GMROI |
+    Utilidad_bruta | Inventario
+    """
+    # Usar los cálculos anteriores
+    rot_df = calcular_inv_turnover(ventas, inventario, regional="ALL" if False else "CENTRO")
+    # TODO: This is a placeholder, the full comparison is done in the app
+
+    # We'll compute per-regional and combine
+    results = []
+    regionals = ["NORTE", "CENTRO", "SUR"]
+
+    for regional in regionals:
+        rot_p = calcular_inv_turnover(ventas, inventario, regional)
+        gmroi_p = calcular_gmroi(ventas, inventario, costos, regional)
+
+        for _, row_rot in rot_p.iterrows():
+            producto = row_rot["Producto"]
+            inv_val = row_rot["Inventario"]
+
+            # Get GMROI for same product/regional
+            gmroi_row = gmroi_p[gmroi_p["Producto"] == producto]
+            gmroi_val = gmroi_row["GMROI"].iloc[0] if not gmroi_row.empty else np.nan
+            utilidad_val = gmroi_row["Utilidad_bruta"].iloc[0] if not gmroi_row.empty else np.nan
+
+            results.append({
+                "Producto": producto,
+                "Regional": regional,
+                "Demanda": row_rot["Demanda"],
+                "Inventario": inv_val,
+                "ROT": row_rot["ROT"],
+                "Utilidad_bruta": utilidad_val,
+                "GMROI": gmroi_val,
+            })
+
+    return pd.DataFrame(results)
+    """Lee las hojas de inventario del Excel.
+
+    Se esperan las hojas: INV.CENTRO, INV.NORTE, INV.SUR.
+    Cada una contiene referencia | producto | inventario.
+
+    Devuelve un DataFrame combinado:
+    REF | PRODUCTO | REGIONAL | INVENTARIO
+    """
+    inventario = []
+
+    for regional, sheet_nombre in [("NORTE", "INV.NORTE"), ("CENTRO", "INV.CENTRO"), ("SUR", "INV.SUR")]:
+        try:
+            df = pd.read_excel(archivo, sheet_name=sheet_nombre, header=None)
+        except Exception:
+            continue
+
+        if df.empty or df.shape[0] < 2:
+            continue
+
+        df_data = df.iloc[2:].reset_index(drop=True)
+        encabezados = df.iloc[1].fillna("").astype(str).str.strip()
+
+        col_inv = None
+        ref_col = None
+        prod_col = None
+        regional_col = None
+
+        for idx, header in enumerate(encabezados):
+            h_lower = header.lower()
+            if ref_col is None and any(p in h_lower for p in ["ref", "referencia", "articulo", "item"]):
+                ref_col = idx
+            elif prod_col is None and any(p in h_lower for p in ["prod", "producto", "sku", "nombre"]):
+                prod_col = idx
+            elif regional_col is None and any(p in h_lower for p in ["region", "reg", "loc", "ubicacion", "centro", "norte", "sur"]):
+                regional_col = idx
+            elif col_inv is None and any(p in h_lower for p in ["inv", "stock", "existencia", "inventor"]):
+                col_inv = idx
+
+        if ref_col is None: ref_col = 0
+        if prod_col is None: prod_col = 1
+        if regional_col is None: regional_col = 0
+
+        for _, fila in df_data.iterrows():
+            ref = fila.iloc[ref_col] if ref_col < len(fila) else None
+            prod = fila.iloc[prod_col] if prod_col < len(fila) else None
+            regional = fila.iloc[regional_col] if regional_col < len(fila) else regional
+
+            if pd.isna(ref) or pd.isna(prod):
+                continue
+
+            try:
+                inv_val = float(fila.iloc[col_inv]) if col_inv is not None and col_inv < len(fila) else np.nan
+            except (ValueError, TypeError):
+                inv_val = np.nan
+
+            inventario.append({
+                "REF": str(ref).strip(),
+                "PRODUCTO": str(prod).strip(),
+                "REGIONAL": str(regional).strip() if pd.notna(regional) else regional,
+                "INVENTARIO": inv_val,
+            })
+
+    if not inventario:
+        return pd.DataFrame(columns=["REF", "PRODUCTO", "REGIONAL", "INVENTARIO"])
+
+    df_inv = pd.DataFrame(inventario)
+    return df_inv.drop_duplicates().reset_index(drop=True)
+
+
 def validar_datos(demanda: pd.DataFrame, costos: pd.DataFrame) -> dict:
     """Valida la estructura de los datos antes de calcular (seccion 6).
 
@@ -820,6 +1437,70 @@ def generar_excel(abc: pd.DataFrame, costos: pd.DataFrame, abc_xyz: pd.DataFrame
                               index=False)
 
 
+    # --- Agregar indicadores adicionales al Excel
+    # (IFR, Rotacion e GMROI) si hay datos de ventas e inventario.
+
+    # --- Agregar indicadores adicionales al Excel
+    # (IFR, Rotacion e GMROI) si hay datos de ventas e inventario.
+    try:
+        ventas = st.session_state.get("_ventas", None)
+        inventario = st.session_state.get("_inventario", None)
+
+        if ventas is not None and not ventas.empty and inventario is not None and not inventario.empty:
+            import openpyxl
+            import shutil
+            import os
+
+            # Copiar el archivo original
+            shutil.copy(ruta_salida, ruta_salida + ".tmp")
+
+            # Abrir el archivo y agregar hojas adicionales
+            with pd.ExcelWriter(ruta_salida + ".tmp", engine="openpyxl",
+                                mode="a", if_sheet_exists="replace") as writer:
+                # IFR semanal
+                ifr_df, ifr_global, ifr_por_ref = preparar_datos_ifr(ventas, inventario)
+                if not ifr_df.empty:
+                    ifr_long = ifr_df.melt(id_vars=["REF", "PRODUCTO", "REGIONAL", "TURN"],
+                                             value_vars=["IFR"],
+                                             var_name="Metrica",
+                                             value_name="Valor")
+                    ifr_long.to_excel(writer, sheet_name="IFR_Semanal", index=False)
+
+                    ifr_resumen = pd.DataFrame({
+                        "Metrica": ["IFR Global",
+                                    "IFR NORTE-MOTO", "IFR CENTRO-MOTO", "IFR SUR-MOTO"],
+                        "Valor": [
+                            ifr_global * 100,
+                            ifr_por_ref.get("NORTE-MOTO", np.nan) * 100,
+                            ifr_por_ref.get("CENTRO-MOTO", np.nan) * 100,
+                            ifr_por_ref.get("SUR-MOTO", np.nan) * 100,
+                        ]
+                    })
+                    ifr_resumen.to_excel(writer, sheet_name="IFR_Resumen", index=False)
+
+                # Rotacion de inventarios
+                rot_df = calcular_rotacion_gmroi_comparacion(ventas, inventario, costos)
+                if not rot_df.empty:
+                    rot_df.to_excel(writer, sheet_name="Rotacion_Inventarios", index=False)
+
+                # GMROI
+                gmroi_df = calcular_gmroi(ventas, inventario, costos, None)
+                if not gmroi_df.empty:
+                    gmroi_df.to_excel(writer, sheet_name="GMROI", index=False)
+
+            # Reemplazar el archivo original
+            os.remove(ruta_salida)
+            os.rename(ruta_salida + ".tmp", ruta_salida)
+
+    except Exception as e:
+        # Si hay error, restaurar el archivo original
+        if os.path.exists(ruta_salida + ".tmp"):
+            os.remove(ruta_salida + ".tmp")
+        st.warning(f"No se pudieron agregar las hojas adicionales al Excel: {e}")
+
+# ---------------------------------------------------------------------------
+# Visualizaciones (secciones 19 y 20)
+
 # ---------------------------------------------------------------------------
 # Visualizaciones (secciones 19 y 20)
 # ---------------------------------------------------------------------------
@@ -995,9 +1676,14 @@ def main():
     try:
         demanda = leer_demanda(archivo)
         costos = leer_costos(archivo)
+        ventas = leer_ventas(archivo)
+        inventario = leer_inventario(archivo)
     except Exception as e:
         st.error(f"Error al leer el archivo: {e}")
         return
+
+    st.session_state["_ventas"] = ventas
+    st.session_state["_inventario"] = inventario
 
     st.sidebar.header("Parametros")
     ventana = st.sidebar.number_input(
@@ -1047,6 +1733,38 @@ def main():
         demanda, n_windows, h
     )
 
+    # --- Cálculo de indicadores adicionales (IFR, rotación, GMROI).
+    # Se calculan solo si existen datos de ventas e inventario.
+    ifr_df = pd.DataFrame()
+    ifr_global = 1.0
+    ifr_por_ref = {}
+    rot_df = pd.DataFrame()
+    gmroi_df = pd.DataFrame()
+
+    if not ventas.empty and not inventario.empty:
+        try:
+            # IFR semanal
+            ifr_df, ifr_global, ifr_por_ref = preparar_datos_ifr(ventas, inventario)
+
+            # Rotación y GMROI por referencia
+            rot_por_regional = []
+            for regional in ["NORTE", "CENTRO", "SUR"]:
+                rot = calcular_inv_turnover(ventas, inventario, regional)
+                if not rot.empty:
+                    rot_por_regional.append(rot)
+                gmroi = calcular_gmroi(ventas, inventario, costos, regional)
+                if not gmroi.empty:
+                    gmroi_df = pd.concat(
+                        [gmroi_df, gmroi], ignore_index=True
+                    )
+
+            if rot_por_regional:
+                rot_df = pd.concat(rot_por_regional, ignore_index=True)
+
+        except Exception as e:
+            st.warning(f"No se pudieron calcular todos los indicadores: {e}")
+
+
     # Defaults de umbrales XYZ a partir de la distribucion de Score%.
     scores_validos = [
         v.get("Score%", np.nan) for v in ganadores.values()
@@ -1060,7 +1778,7 @@ def main():
 
     # --- Pestanas: una por seccion (secuencia de la seccion 18).
     tab_carga, tab_costos, tab_abc, tab_pron, tab_xyz, tab_abcxyz, \
-        tab_cons, tab_rs, tab_concl = st.tabs([
+        tab_cons, tab_rs, tab_ifr, tab_rotgmroi, tab_concl = st.tabs([
             "1. Carga y validacion",
             "2. Costos y precios",
             "3. ABC",
@@ -1069,7 +1787,9 @@ def main():
             "6. ABC-XYZ",
             "7. Consolidado",
             "8. Revision periodica (R,S)",
-            "9. Conclusiones y exportacion",
+            "9. IFR y Rotacion de Inventarios (indicadores de servicio)",
+            "10. Inventarios y GMROI",
+            "11. Conclusiones y exportacion",
         ])
 
     # --- Pestana 1: detalle de la validacion.
@@ -1208,6 +1928,64 @@ def main():
             "ganador y el **RMSE** del motor (no el promedio ni la desviacion "
             "del historico) para estimar la demanda del periodo de proteccion "
             "y el stock de seguridad."
+
+    # --- Pestana 9: Indicador de Tasa de Llenado (IFR)
+    with tab_ifr:
+        st.markdown("#### Tasa de llenado por producto y referencia (IFR)")
+        st.markdown(
+            "El **IFR (Item Fill Rate)** mide el porcentaje de demanda "
+            "cubierta por la disponibilidad de inventario. Se calcula "
+            "semanalmente para cada producto en cada referencia."
+        )
+
+        if ifr_df.empty:
+            st.info("No hay datos suficientes de ventas e inventario para "
+                    "calcular el IFR semanal.")
+        else:
+            st.plotly_chart(grafica_ifr_semanal_por_referencia(ifr_df),
+                            use_container_width=True)
+            st.dataframe(ifr_df, use_container_width=True)
+
+            # IFR global
+            st.subheader("IFR Global")
+            st.metric("IFR Global", f"{ifr_global * 100:.2f}%")
+            st.plotly_chart(
+                grafica_ifr_global(ifr_global, ifr_por_ref),
+                use_container_width=True
+            )
+            st.caption("IFR Global = unidades cubiertas / unidades demanadas "
+                       "en el periodo.")
+
+    # --- Pestana 10: Rotacion de inventarios y GMROI
+    with tab_rotgmroi:
+        st.markdown("#### Rotacion de inventarios y GMROI por regional")
+        st.markdown(
+            "La **rotacion de inventarios (ROT)** mide cuantas veces el "
+            "inventario se 'gira' durante un periodo: ROT = Demanda / "
+            "Inventario."
+        )
+        st.markdown(
+            "El **GMROI (Gross Margin Return On Investment)** mide la "
+            "utilidad generada por cada peso invertido en inventario: "
+            "GMROI = Utilidad bruta / Costo de inventario."
+        )
+
+        if rot_df.empty:
+            st.info("No hay datos suficientes de ventas e inventario para "
+                    "calcular la rotacion.")
+        else:
+            st.subheader("Rotacion de Inventarios")
+            st.plotly_chart(grafica_rotacion_inventarios(rot_df),
+                            use_container_width=True)
+            st.dataframe(rot_df, use_container_width=True)
+
+        if not gmroi_df.empty:
+            st.subheader("GMROI (Gross Margin Return On Investment)")
+            st.plotly_chart(grafica_gmroi(gmroi_df), use_container_width=True)
+            st.dataframe(gmroi_df, use_container_width=True)
+        elif rot_df.empty:
+            st.info("No hay datos suficientes de ventas, inventario y costos "
+                    "para calcular el GMROI.")
         )
 
         rs1, rs2, rs3 = st.columns(3)
@@ -1501,6 +2279,8 @@ def main():
                     else ["(sin conclusiones)"],
                     ruta_salida,
                     rs_tabla=rs_tabla,
+                    ventas=ventas,
+                    inventario=inventario,
                 )
                 st.success(f"Excel generado: {nombre_salida} "
                            "(en la carpeta del proyecto).")
