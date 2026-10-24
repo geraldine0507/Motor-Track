@@ -1,3 +1,4 @@
+# BACKUP_CHECK
 # -*- coding: utf-8 -*-
 """
 Mototrack - Costos, clasificacion ABC-XYZ y motor de pronosticos.
@@ -256,14 +257,14 @@ def leer_costos(archivo) -> pd.DataFrame:
 def leer_ventas(archivo) -> pd.DataFrame:
     """Lee las hojas de ventas del Excel.
 
-    Se esperan las hojas: VENTAS.CENTRO, VENTAS.NORTE, VENTAS.SUR.
+    Se esperan las hojas: Ventas NORTE, Ventas CENTRO, Ventas SUR.
     Cada una contiene: Turno | REGIONAL | PRODUCTO | VENTAS.
 
     Devuelve un DataFrame largo: Turn | REGIONAL | PRODUCTO | VENTAS
     """
     ventas = []
 
-    for regional, sheet_nombre in [("NORTE", "VENTAS.NORTE"), ("CENTRO", "VENTAS.CENTRO"), ("SUR", "VENTAS.SUR")]:
+    for regional, sheet_nombre in [("NORTE", "Ventas NORTE"), ("CENTRO", "Ventas CENTRO"), ("SUR", "Ventas SUR")]:
         try:
             df = pd.read_excel(archivo, sheet_name=sheet_nombre, header=None)
         except Exception:
@@ -418,10 +419,9 @@ def calcular_ifr_referencia(ventas: pd.DataFrame, inventario: pd.DataFrame,
 
     IFR = Unidades demanadas cubiertas / Unidades demanadas
 
-    Se calcula a nivel de semana/turno para permitir el analisis
-    temporal semanal.
+    Se calcula a nivel de turno para permitir el analisis temporal semanal.
 
-    Devuelve: (porcentajes_por_trimestre, total_cubiertas, total_demanado)
+    Devuelve: (porcentajes_por_turno, total_cubiertas, total_demanado)
     """
     ventas_prod = ventas[
         (ventas["PRODUCTO"] == producto) & (ventas["REGIONAL"] == regional)
@@ -438,35 +438,50 @@ def calcular_ifr_referencia(ventas: pd.DataFrame, inventario: pd.DataFrame,
     inv_grupo = inv_prod.groupby("Turn")["INVENTARIO"].sum().sort_index()
 
     fpr_trim = []
+    total_cubiertas = 0.0
+    total_demanado = 0.0
 
     for turn, demanda in ventas_grupo.items():
         if demanda > 0:
             inv_disp = inv_grupo.get(turn, 0.0)
+            # IFR = ventas atendidas / demanda real
+            # ventas atendidas = min(lo que se pudo cubrir, demanda real)
+            # Asumimos que se cubren unidades seguras proportional al inventario disponible
             cubierto = min(inv_disp, demanda)
             ifr = cubierto / demanda
             fpr_trim.append(ifr)
+            total_cubiertas += cubierto
+            total_demanado += demanda
         else:
             fpr_trim.append(1.0)
 
-    return pd.Series(fpr_trim, index=ventas_grupo.index), ventas_grupo.sum(), 0.0
+    return pd.Series(fpr_trim, index=ventas_grupo.index), total_cubiertas, total_demanado
 
 
 def calcular_ifr_global(ventas: pd.DataFrame, inventario: pd.DataFrame) -> float:
     """Calcula el IFR global para el portfolio completo.
 
-    IFR_global = Σ unidades cubiertas / Σ unidades demanadas
+    IFR_global = ventas atendidas / demanda real, ponderado por unidades demandadas.
 
-    Esto evidencia la robustez/global del servicio.
+    Esto evidencia la robustez/global del servicio considerando las ventas reales.
     """
-    total_demanado = ventas["VENTAS"].sum()
+    # Agrupar ventas por turno y calcular total demandado por turno
+    ventas_grupo = ventas.groupby("Turn")["VENTAS"].sum().sort_index()
+    
+    total_demanado = ventas_grupo.sum()
     if total_demanado == 0:
-        return 1.0
+        return np.nan
 
-    total_inventario = inventario["INVENTARIO"].sum()
-
-    cubierto_total = min(total_inventario, total_demanado)
-
-    ifr_global = cubierto_total / total_demanado
+    # Calcular ventas cubiertas por turno (atendidas = min(inventario disponible, demanda))
+    # y acumular total cubierto y total demandado
+    total_cubierto = 0.0
+    
+    for turn, demanda in ventas_grupo.items():
+        inv_disp = inventario[inventario["Turn"] == turn]["INVENTARIO"].sum() if "Turn" in inventario.columns else 0
+        cubierto = min(inv_disp, demanda)
+        total_cubierto += cubierto
+    
+    ifr_global = total_cubierto / total_demanado
     return ifr_global
 
 
@@ -587,7 +602,8 @@ def grafica_ifr_semanal_por_referencia(ifr_df: pd.DataFrame) -> go.Figure:
         fig = go.Figure()
         fig.add_annotation(text="No hay datos suficientes para graficar IFR.",
                            x=0.5, y=0.5, showarrow=False,
-                           font=dict(size=14), showgrid=False, paper_bgcolor="white")
+                           font=dict(size=14), showgrid=False, paper_bgcolor="white",
+                           xref="paper", yref="paper")
         return fig
 
     fig = make_subplots(
@@ -643,13 +659,16 @@ def grafica_ifr_global(ifr_global: float, ifr_por_referencia: dict) -> go.Figure
     """
     refs = list(ifr_por_referencia.keys())
     valores = [ifr_por_referencia[r] * 100 for r in refs]
-    valores.append(ifr_global * 100)
+    etiquetas = list(refs)
+    if not pd.isna(ifr_global):
+        valores.append(ifr_global * 100)
+        etiquetas.append("GLOBAL")
 
     fig = go.Figure()
 
     fig.add_trace(
         go.Bar(
-            x=refs + ["GLOBAL"],
+            x=etiquetas,
             y=valores,
             marker_color=["#e74c3c", "#3498db", "#2ecc71", "#9b59b6"],
             text=[f"{v:.1f}%" for v in valores],
@@ -681,7 +700,7 @@ def preparar_datos_ifr(ventas: pd.DataFrame, inventario: pd.DataFrame) -> tuple:
 
     # Alarme si no hay datos de ventas
     if ventas.empty or inventario.empty:
-        return pd.DataFrame(), 1.0, {}
+        return pd.DataFrame(), np.nan, {}
 
     for regional in ["NORTE", "CENTRO", "SUR"]:
         for producto in PRODUCTOS:
@@ -744,7 +763,7 @@ def preparar_datos_ifr(ventas: pd.DataFrame, inventario: pd.DataFrame) -> tuple:
         cubierto = min(total_inventario, total_demanado)
         ifr_global = cubierto / total_demanado
     else:
-        ifr_global = 1.0
+        ifr_global = np.nan
 
     # IFR por referencia
     ifr_por_ref = {}
@@ -878,7 +897,6 @@ def calcular_rotacion_gmroi_comparacion(ventas: pd.DataFrame, inventario: pd.Dat
             })
 
     return pd.DataFrame(results)
-    """Lee las hojas de inventario del Excel.
 
     Se esperan las hojas: INV.CENTRO, INV.NORTE, INV.SUR.
     Cada una contiene referencia | producto | inventario.
@@ -1453,11 +1471,16 @@ def generar_excel(abc: pd.DataFrame, costos: pd.DataFrame, abc_xyz: pd.DataFrame
                   info_ventana: dict, n_windows: int, h: int,
                   limite_xy: float, limite_yz: float,
                   conclusiones: list, ruta_salida: str,
-                  rs_tabla: pd.DataFrame = None) -> None:
+                  rs_tabla: pd.DataFrame = None,
+                  ventas: pd.DataFrame = None, inventario: pd.DataFrame = None) -> None:
     """Genera el Excel de resultados sin sobrescribir la fuente (seccion 21).
 
     Hojas minimas: Resumen, Costos, Clasif ABC_XYZ, Pronosticos,
     Comparacion_Modelos, Conclusiones. Si se provee, ademas Revision_Periodica.
+
+    Params adicionales:
+      ventas, inventario: DataFrames con datos de ventas e inventario para
+        agregar hojas IFR, Rotacion y GMROI.
     """
     # --- Hoja Resumen: parametros y conteos.
     utilidad_total = float(abc["Utilidad total"].sum())
@@ -1517,9 +1540,6 @@ def generar_excel(abc: pd.DataFrame, costos: pd.DataFrame, abc_xyz: pd.DataFrame
     # --- Agregar indicadores adicionales al Excel
     # (IFR, Rotacion e GMROI) si hay datos de ventas e inventario.
     try:
-        ventas = st.session_state.get("_ventas", None)
-        inventario = st.session_state.get("_inventario", None)
-
         if ventas is not None and not ventas.empty and inventario is not None and not inventario.empty:
             import openpyxl
             import shutil
@@ -1558,7 +1578,11 @@ def generar_excel(abc: pd.DataFrame, costos: pd.DataFrame, abc_xyz: pd.DataFrame
                     rot_df.to_excel(writer, sheet_name="Rotacion_Inventarios", index=False)
 
                 # GMROI
-                gmroi_df = calcular_gmroi(ventas, inventario, costos, None)
+                gmroi_df = pd.DataFrame()
+                for _reg in ["NORTE", "CENTRO", "SUR"]:
+                    _g = calcular_gmroi(ventas, inventario, costos, _reg)
+                    if not _g.empty:
+                        gmroi_df = pd.concat([gmroi_df, _g], ignore_index=True)
                 if not gmroi_df.empty:
                     gmroi_df.to_excel(writer, sheet_name="GMROI", index=False)
 
@@ -1583,7 +1607,7 @@ def grafica_pronosticos_oficial(df_ts: pd.DataFrame, pronosticos: dict,
                                 h: int, turn_max: int) -> go.Figure:
     """Visualizacion oficial de pronosticos (seccion 19).
 
-    Subplots 2x3: NORTE, CENTRO, SUR, CEDI (C+S), MOTOTRAK (N+C+S), sexto vacio.
+    Subplots 2 por 3: NORTE, CENTRO, SUR, CEDI (C+S), MOTOTRAK (N+C+S), sexto vacio.
     Linea solida = real; punteada = pronostico. Ultimos 52+h turnos.
     Colores: MOTO=salmon, CUATRIMOTO=navy, TRACTOR=darkcyan. Leyenda una vez.
 
@@ -1810,7 +1834,7 @@ def main():
     # --- Cálculo de indicadores adicionales (IFR, rotación, GMROI).
     # Se calculan solo si existen datos de ventas e inventario.
     ifr_df = pd.DataFrame()
-    ifr_global = 1.0
+    ifr_global = np.nan
     ifr_por_ref = {}
     rot_df = pd.DataFrame()
     gmroi_df = pd.DataFrame()
@@ -2022,7 +2046,10 @@ def main():
 
             # IFR global
             st.subheader("IFR Global")
-            st.metric("IFR Global", f"{ifr_global * 100:.2f}%")
+            if pd.isna(ifr_global):
+                st.metric("IFR Global", "No calculable")
+            else:
+                st.metric("IFR Global", f"{ifr_global * 100:.2f}%")
             st.plotly_chart(
                 grafica_ifr_global(ifr_global, ifr_por_ref),
                 use_container_width=True
@@ -2187,7 +2214,7 @@ def main():
             )
 
         def _estado(desv, s_obj):
-            """Clasifica la posicion de inventario vs el nivel objetivo S."""
+            # Clasifica la posicion de inventario vs el nivel objetivo S
             if pd.isna(desv) or pd.isna(s_obj):
                 return "Sin dato"
             if desv > 0:
